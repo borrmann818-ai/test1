@@ -153,12 +153,20 @@ def discover_protocols(
 
 
 def extract_pages_text(pdf_path: Path) -> list[str]:
+    """Liest den Text jeder Seite. Die Protokolle sind zweispaltig gesetzt;
+    pdfplumber's Standard-extract_text() liest ueber die volle Seitenbreite
+    und verwuerfelt dabei linke und rechte Spalte zeilenweise. Stattdessen
+    wird jede Seite an der Seitenmitte in zwei Spalten geschnitten und jede
+    Spalte separat extrahiert (linke Spalte komplett vor der rechten)."""
     if pdfplumber is None:
         raise RuntimeError("pdfplumber ist nicht installiert (pip install pdfplumber)")
     pages = []
     with pdfplumber.open(str(pdf_path)) as pdf:
         for page in pdf.pages:
-            pages.append(page.extract_text() or "")
+            mid = page.width / 2
+            left = page.crop((0, 0, mid, page.height)).extract_text() or ""
+            right = page.crop((mid, 0, page.width, page.height)).extract_text() or ""
+            pages.append(left + "\n" + right)
     return pages
 
 
