@@ -17,10 +17,12 @@ Verwendung:
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import re
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Iterator, Optional
 
@@ -221,6 +223,36 @@ def parse_speeches(pages: list[str], wp: int, sitzung: int, quelle_url: str) -> 
     return beitraege
 
 
+def load_checkpoint(path: Path) -> tuple[dict[tuple[int, int], list[Redebeitrag]], list[Redebeitrag]]:
+    """Laedt bereits verarbeitete Sitzungen aus einer Checkpoint-Datei (JSON Lines),
+    damit ein Neustart nicht wieder von vorn parsen muss."""
+    done: dict[tuple[int, int], list[Redebeitrag]] = {}
+    rows: list[Redebeitrag] = []
+    if not path.exists():
+        return done, rows
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            obj = json.loads(line)
+            session_rows = [Redebeitrag(**r) for r in obj["rows"]]
+            done[(obj["wp"], obj["nr"])] = session_rows
+            rows.extend(session_rows)
+    return done, rows
+
+
+def append_checkpoint(path: Path, wp: int, nr: int, rows: list[Redebeitrag]) -> None:
+    """Haengt das Ergebnis einer Sitzung an die Checkpoint-Datei an und erzwingt
+    sofortiges Schreiben auf die Platte, damit bei einem Absturz nichts verloren geht."""
+    entry = {"wp": wp, "nr": nr, "rows": [asdict(r) for r in rows]}
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False))
+        f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+
+
 def write_excel(rows: list[Redebeitrag], out_path: Path) -> None:
     if Workbook is None:
         raise RuntimeError("openpyxl ist nicht installiert (pip install openpyxl)")
@@ -310,26 +342,41 @@ def run(
     max_sessions: int,
     test_mode: bool,
     speaker_filter: Optional[str] = None,
+    checkpoint_path: Optional[Path] = None,
 ) -> None:
     session = build_session()
     all_rows: list[Redebeitrag] = []
+    done: dict[tuple[int, int], list[Redebeitrag]] = {}
+    if checkpoint_path is not None:
+        done, checkpoint_rows = load_checkpoint(checkpoint_path)
+        all_rows.extend(checkpoint_rows)
+        if done:
+            print(f"[Checkpoint] {len(checkpoint_rows)} Redebeitraege aus {len(done)} "
+                  f"bereits verarbeiteten Sitzungen aus {checkpoint_path} geladen.")
 
     for wp in wahlperioden:
         print(f"\n=== Wahlperiode {wp}: suche Plenarprotokolle ===")
         found_any = False
         for nr, pdf_path, source in discover_protocols(session, wp, cache_dir, delay, max_sessions=max_sessions):
             found_any = True
-            print(f"  Sitzung {nr:03d}: {source} -> {pdf_path.name}")
-            try:
-                pages = extract_pages_text(pdf_path)
-            except Exception as exc:
-                print(f"    [WARN] PDF-Extraktion fehlgeschlagen: {exc}", file=sys.stderr)
-                continue
-            rows = parse_speeches(pages, wp, nr, source)
-            if speaker_filter:
-                rows = [r for r in rows if speaker_filter.lower() in r.redner.lower()]
-            print(f"    -> {len(rows)} Redebeitraege extrahiert")
-            all_rows.extend(rows)
+            key = (wp, nr)
+            if key in done:
+                rows = done[key]
+                print(f"  Sitzung {nr:03d}: (checkpoint) {len(rows)} Redebeitraege")
+            else:
+                print(f"  Sitzung {nr:03d}: {source} -> {pdf_path.name}")
+                try:
+                    pages = extract_pages_text(pdf_path)
+                except Exception as exc:
+                    print(f"    [WARN] PDF-Extraktion fehlgeschlagen: {exc}", file=sys.stderr)
+                    continue
+                rows = parse_speeches(pages, wp, nr, source)
+                if speaker_filter:
+                    rows = [r for r in rows if speaker_filter.lower() in r.redner.lower()]
+                print(f"    -> {len(rows)} Redebeitraege extrahiert")
+                all_rows.extend(rows)
+                if checkpoint_path is not None:
+                    append_checkpoint(checkpoint_path, wp, nr, rows)
             if test_mode:
                 break  # im Testmodus nur eine Sitzung pro Wahlperiode
         if not found_any:
@@ -353,6 +400,9 @@ def main() -> None:
     parser.add_argument("--max-sessions", type=int, default=MAX_SESSIONS_PER_WP, help="Max. Sitzungsnummer pro Wahlperiode")
     parser.add_argument("--test", action="store_true", help="Schneller Funktionscheck: Offline-Selbsttest + 1 Sitzung pro WP")
     parser.add_argument("--speaker", type=str, default=None, help="Nur Redebeitraege dieser Person uebernehmen (Teilstring, Gross-/Kleinschreibung egal)")
+    parser.add_argument("--checkpoint", type=Path, default=Path("checkpoint.jsonl"),
+                         help="Datei zum laufenden Speichern des Fortschritts (JSON Lines); bei Neustart wird daraus fortgesetzt")
+    parser.add_argument("--no-checkpoint", action="store_true", help="Checkpoint-Datei nicht verwenden")
     args = parser.parse_args()
 
     ok = run_selftest()
@@ -364,7 +414,9 @@ def main() -> None:
         print("\n[Testmodus] Lade jeweils nur die erste erreichbare Sitzung pro Wahlperiode ...")
         run(args.wp, Path("test_" + args.out.name), args.cache_dir, args.delay, max_sessions=10, test_mode=True, speaker_filter=args.speaker)
     else:
-        run(args.wp, args.out, args.cache_dir, args.delay, args.max_sessions, test_mode=False, speaker_filter=args.speaker)
+        checkpoint_path = None if args.no_checkpoint else args.checkpoint
+        run(args.wp, args.out, args.cache_dir, args.delay, args.max_sessions, test_mode=False,
+            speaker_filter=args.speaker, checkpoint_path=checkpoint_path)
 
 
 if __name__ == "__main__":
