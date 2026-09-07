@@ -82,6 +82,7 @@ class Redebeitrag:
     rolle_fraktion: str
     text: str
     quelle_url: str
+    seite: int = 0
 
 
 def build_session() -> requests.Session:
@@ -107,19 +108,23 @@ def get_with_retries(session: requests.Session, url: str, tries: int = 3, timeou
     return None
 
 
-def download_protocol(session: requests.Session, wp: int, nr: int, cache_dir: Path) -> Optional[tuple[Path, str]]:
-    """Laedt ein Plenarprotokoll-PDF herunter (mit lokalem Cache). Gibt (Pfad, Quelle-URL) oder None zurueck."""
+def download_protocol(session: requests.Session, wp: int, nr: int, cache_dir: Path) -> Optional[tuple[Path, str, bool]]:
+    """Laedt ein Plenarprotokoll-PDF herunter (mit lokalem Cache).
+    Gibt (Pfad, Quelle-URL, aus_cache) oder None zurueck. Die Quelle-URL ist immer
+    die echte PDF-URL (auch bei einem Cache-Treffer), damit sie als Verweis in der
+    Excel-Ausgabe verwendet werden kann."""
     cache_dir.mkdir(parents=True, exist_ok=True)
     local_path = cache_dir / f"wp{wp}_{nr:03d}stzg.pdf"
+    canonical_url = PDF_URL_TEMPLATES[0].format(wp=wp, nr=nr)
     if local_path.exists() and local_path.stat().st_size > 0:
-        return local_path, f"(cache) {local_path.name}"
+        return local_path, canonical_url, True
 
     for template in PDF_URL_TEMPLATES:
         url = template.format(wp=wp, nr=nr)
         resp = get_with_retries(session, url)
         if resp is not None and resp.status_code == 200 and resp.content[:4] == b"%PDF":
             local_path.write_bytes(resp.content)
-            return local_path, url
+            return local_path, url, False
     return None
 
 
@@ -130,7 +135,7 @@ def discover_protocols(
     delay: float,
     max_sessions: int = MAX_SESSIONS_PER_WP,
     max_consecutive_misses: int = MAX_CONSECUTIVE_MISSES,
-) -> Iterator[tuple[int, Path, str]]:
+) -> Iterator[tuple[int, Path, str, bool]]:
     """Probiert Sitzungsnummern sequenziell durch, bis mehrere Treffer in Folge fehlen."""
     misses = 0
     for nr in range(1, max_sessions + 1):
@@ -141,8 +146,8 @@ def discover_protocols(
                 break
             continue
         misses = 0
-        path, url = result
-        yield nr, path, url
+        path, url, from_cache = result
+        yield nr, path, url, from_cache
         if delay:
             time.sleep(delay)
 
@@ -164,14 +169,13 @@ def extract_datum(first_pages_text: str) -> str:
 
 def parse_speeches(pages: list[str], wp: int, sitzung: int, quelle_url: str) -> list[Redebeitrag]:
     """Segmentiert den Volltext eines Protokolls in einzelne Redebeitraege."""
-    full_text = "\n".join(pages)
     datum = extract_datum("\n".join(pages[:2]))
 
-    lines = full_text.splitlines()
     beitraege: list[Redebeitrag] = []
     current_speaker = None
     current_rolle = ""
     current_buffer: list[str] = []
+    current_start_page = 1
     seq = 0
 
     def flush():
@@ -190,35 +194,41 @@ def parse_speeches(pages: list[str], wp: int, sitzung: int, quelle_url: str) -> 
                         rolle_fraktion=current_rolle,
                         text=text,
                         quelle_url=quelle_url,
+                        seite=current_start_page,
                     )
                 )
 
-    for raw_line in lines:
-        line = raw_line.strip()
-        if not line:
-            continue
-        m = SPEAKER_RE.match(line)
-        # Heuristik gegen False Positives: Name-Teil darf nicht zu lang sein, muss
-        # aus mindestens zwei Woertern bestehen (Vorname + Nachname, ggf. mit
-        # Praesidiums-Titel) und mit Grossbuchstaben beginnen; Zwischenrufe/
-        # Regieanweisungen wie "(Beifall bei der CDU)" beginnen mit "(" und werden
-        # hier nicht erfasst. Kurze Ablaufvermerke wie "Beginn: 10:00 Uhr" werden
-        # durch die Mindestwortanzahl ausgeschlossen.
-        if (
-            m
-            and len(m.group("name")) <= 60
-            and len(m.group("name").split()) >= 2
-            and not line.startswith("(")
-        ):
-            flush()
-            current_speaker = m.group("name").strip()
-            current_rolle = (m.group("rolle") or "").strip()
-            current_buffer = [m.group("rest")] if m.group("rest") else []
-        elif STAGE_DIRECTION_RE.match(line):
-            continue  # Zwischenruf/Regieanweisung, nicht Teil des Redetexts
-        else:
-            if current_speaker:
-                current_buffer.append(line)
+    # Seitenweise iterieren (statt ueber den zusammengefuegten Volltext), damit
+    # jedem Redebeitrag die PDF-Seite zugeordnet werden kann, auf der er beginnt -
+    # als Sprungziel (#page=N) fuer die Quelle-Spalte in der Excel-Ausgabe.
+    for page_idx, page_text in enumerate(pages, start=1):
+        for raw_line in page_text.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            m = SPEAKER_RE.match(line)
+            # Heuristik gegen False Positives: Name-Teil darf nicht zu lang sein, muss
+            # aus mindestens zwei Woertern bestehen (Vorname + Nachname, ggf. mit
+            # Praesidiums-Titel) und mit Grossbuchstaben beginnen; Zwischenrufe/
+            # Regieanweisungen wie "(Beifall bei der CDU)" beginnen mit "(" und werden
+            # hier nicht erfasst. Kurze Ablaufvermerke wie "Beginn: 10:00 Uhr" werden
+            # durch die Mindestwortanzahl ausgeschlossen.
+            if (
+                m
+                and len(m.group("name")) <= 60
+                and len(m.group("name").split()) >= 2
+                and not line.startswith("(")
+            ):
+                flush()
+                current_speaker = m.group("name").strip()
+                current_rolle = (m.group("rolle") or "").strip()
+                current_buffer = [m.group("rest")] if m.group("rest") else []
+                current_start_page = page_idx
+            elif STAGE_DIRECTION_RE.match(line):
+                continue  # Zwischenruf/Regieanweisung, nicht Teil des Redetexts
+            else:
+                if current_speaker:
+                    current_buffer.append(line)
     flush()
     return beitraege
 
@@ -259,12 +269,16 @@ def write_excel(rows: list[Redebeitrag], out_path: Path) -> None:
     wb = Workbook()
     ws = wb.active
     ws.title = "Redebeitraege"
-    headers = ["Wahlperiode", "Sitzung", "Datum", "Nr", "Redner", "Rolle/Fraktion", "Redebeitrag", "Quelle"]
+    headers = ["Wahlperiode", "Sitzung", "Datum", "Nr", "Redner", "Rolle/Fraktion", "Redebeitrag", "Seite", "Quelle (PDF)"]
     ws.append(headers)
     for r in rows:
-        ws.append([r.wahlperiode, r.sitzung, r.datum, r.nr, r.redner, r.rolle_fraktion, r.text, r.quelle_url])
+        link = f"{r.quelle_url}#page={r.seite}" if r.seite else r.quelle_url
+        ws.append([r.wahlperiode, r.sitzung, r.datum, r.nr, r.redner, r.rolle_fraktion, r.text, r.seite, link])
+        quelle_cell = ws.cell(row=ws.max_row, column=9)
+        quelle_cell.hyperlink = link
+        quelle_cell.style = "Hyperlink"
     ws.freeze_panes = "A2"
-    widths = [11, 8, 11, 5, 28, 30, 90, 45]
+    widths = [11, 8, 11, 5, 28, 30, 90, 7, 45]
     for i, w in enumerate(widths, start=1):
         ws.column_dimensions[get_column_letter(i)].width = w
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -357,14 +371,15 @@ def run(
     for wp in wahlperioden:
         print(f"\n=== Wahlperiode {wp}: suche Plenarprotokolle ===")
         found_any = False
-        for nr, pdf_path, source in discover_protocols(session, wp, cache_dir, delay, max_sessions=max_sessions):
+        for nr, pdf_path, source, from_cache in discover_protocols(session, wp, cache_dir, delay, max_sessions=max_sessions):
             found_any = True
             key = (wp, nr)
             if key in done:
                 rows = done[key]
                 print(f"  Sitzung {nr:03d}: (checkpoint) {len(rows)} Redebeitraege")
             else:
-                print(f"  Sitzung {nr:03d}: {source} -> {pdf_path.name}")
+                cache_note = "(cache) " if from_cache else ""
+                print(f"  Sitzung {nr:03d}: {cache_note}{source} -> {pdf_path.name}")
                 try:
                     pages = extract_pages_text(pdf_path)
                 except Exception as exc:
