@@ -302,7 +302,15 @@ def run_selftest() -> bool:
     return ok
 
 
-def run(wahlperioden: list[int], out_path: Path, cache_dir: Path, delay: float, max_sessions: int, test_mode: bool) -> None:
+def run(
+    wahlperioden: list[int],
+    out_path: Path,
+    cache_dir: Path,
+    delay: float,
+    max_sessions: int,
+    test_mode: bool,
+    speaker_filter: Optional[str] = None,
+) -> None:
     session = build_session()
     all_rows: list[Redebeitrag] = []
 
@@ -318,6 +326,8 @@ def run(wahlperioden: list[int], out_path: Path, cache_dir: Path, delay: float, 
                 print(f"    [WARN] PDF-Extraktion fehlgeschlagen: {exc}", file=sys.stderr)
                 continue
             rows = parse_speeches(pages, wp, nr, source)
+            if speaker_filter:
+                rows = [r for r in rows if speaker_filter.lower() in r.redner.lower()]
             print(f"    -> {len(rows)} Redebeitraege extrahiert")
             all_rows.extend(rows)
             if test_mode:
@@ -342,6 +352,7 @@ def main() -> None:
     parser.add_argument("--delay", type=float, default=0.5, help="Wartezeit zwischen Downloads in Sekunden")
     parser.add_argument("--max-sessions", type=int, default=MAX_SESSIONS_PER_WP, help="Max. Sitzungsnummer pro Wahlperiode")
     parser.add_argument("--test", action="store_true", help="Schneller Funktionscheck: Offline-Selbsttest + 1 Sitzung pro WP")
+    parser.add_argument("--speaker", type=str, default=None, help="Nur Redebeitraege dieser Person uebernehmen (Teilstring, Gross-/Kleinschreibung egal)")
     args = parser.parse_args()
 
     ok = run_selftest()
@@ -351,9 +362,9 @@ def main() -> None:
 
     if args.test:
         print("\n[Testmodus] Lade jeweils nur die erste erreichbare Sitzung pro Wahlperiode ...")
-        run(args.wp, Path("test_" + args.out.name), args.cache_dir, args.delay, max_sessions=10, test_mode=True)
+        run(args.wp, Path("test_" + args.out.name), args.cache_dir, args.delay, max_sessions=10, test_mode=True, speaker_filter=args.speaker)
     else:
-        run(args.wp, args.out, args.cache_dir, args.delay, args.max_sessions, test_mode=False)
+        run(args.wp, args.out, args.cache_dir, args.delay, args.max_sessions, test_mode=False, speaker_filter=args.speaker)
 
 
 if __name__ == "__main__":
