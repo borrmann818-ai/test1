@@ -4,3 +4,4 @@ pdfs/
 *.log
 *.xlsx
 checkpoint.jsonl
+*.jsonl.bak
