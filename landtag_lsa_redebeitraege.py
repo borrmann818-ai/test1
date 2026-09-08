@@ -62,12 +62,17 @@ STAGE_DIRECTION_RE = re.compile(r"^\(.*\)$")
 #   "Guido Kosmehl (FDP):"
 #   "Praesidentin Gabriele Brakebusch:"
 #   "Petra Grimm-Benne (Ministerin fuer Arbeit, Soziales und Integration):"
+#   "Herr Bullerjahn, Minister der Finanzen:"  (Amtstraeger ohne Klammer-Rolle,
+#   stattdessen komma-getrennter Titel vor dem Doppelpunkt)
 SPEAKER_RE = re.compile(
     r"^(?P<name>"
     r"(?:Präsidentin|Präsident|Vizepräsidentin|Vizepräsident|Alterspräsident|Alterspräsidentin)?\s*"
     r"[A-ZÄÖÜ][\wÄÖÜäöüß.\-]*(?:\s+(?:von|van|de|der)?\s*[A-ZÄÖÜ][\wÄÖÜäöüß.\-]*){0,4}"
     r")"
-    r"\s*(?:\((?P<rolle>[^()]{1,120})\))?"
+    r"\s*(?:"
+    r"\((?P<rolle>[^()]{1,120})\)"
+    r"|,\s*(?P<rolle2>(?:Minister(?:in)?|Staatssekretär(?:in)?)\b[^:()]{0,100})"
+    r")?"
     r"\s*:\s*(?P<rest>.*)$"
 )
 
@@ -229,7 +234,7 @@ def parse_speeches(pages: list[str], wp: int, sitzung: int, quelle_url: str) -> 
             ):
                 flush()
                 current_speaker = m.group("name").strip()
-                current_rolle = (m.group("rolle") or "").strip()
+                current_rolle = (m.group("rolle") or m.group("rolle2") or "").strip()
                 current_buffer = [m.group("rest")] if m.group("rest") else []
                 current_start_page = page_idx
             elif STAGE_DIRECTION_RE.match(line):
@@ -277,16 +282,18 @@ def write_excel(rows: list[Redebeitrag], out_path: Path) -> None:
     wb = Workbook()
     ws = wb.active
     ws.title = "Redebeitraege"
-    headers = ["Wahlperiode", "Sitzung", "Datum", "Nr", "Redner", "Rolle/Fraktion", "Redebeitrag", "Seite", "Quelle (PDF)"]
+    headers = ["Wahlperiode", "Sitzung", "Datum", "Nr", "Redner", "Rolle/Fraktion", "Wortanzahl", "Zeichenanzahl", "Redebeitrag", "Seite", "Quelle (PDF)"]
     ws.append(headers)
     for r in rows:
         link = f"{r.quelle_url}#page={r.seite}" if r.seite else r.quelle_url
-        ws.append([r.wahlperiode, r.sitzung, r.datum, r.nr, r.redner, r.rolle_fraktion, r.text, r.seite, link])
-        quelle_cell = ws.cell(row=ws.max_row, column=9)
+        wortanzahl = len(r.text.split())
+        zeichenanzahl = len(r.text)
+        ws.append([r.wahlperiode, r.sitzung, r.datum, r.nr, r.redner, r.rolle_fraktion, wortanzahl, zeichenanzahl, r.text, r.seite, link])
+        quelle_cell = ws.cell(row=ws.max_row, column=11)
         quelle_cell.hyperlink = link
         quelle_cell.style = "Hyperlink"
     ws.freeze_panes = "A2"
-    widths = [11, 8, 11, 5, 28, 30, 90, 7, 45]
+    widths = [11, 8, 11, 5, 28, 30, 11, 13, 90, 7, 45]
     for i, w in enumerate(widths, start=1):
         ws.column_dimensions[get_column_letter(i)].width = w
     out_path.parent.mkdir(parents=True, exist_ok=True)
